@@ -13,7 +13,7 @@ When you click the **Knit** button a document will be generated that includes bo
 summary(cars)
 ```
 
-You can also embed plots, for example:
+You can also embed plots, for example: embedded plot
 
 ```{r, echo=FALSE}
 plot(cars)
