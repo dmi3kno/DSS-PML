@@ -1,22 +1,311 @@
 ---
 title: "DSS PML Course project"
 author: "Dmytro Perepolkin"
-date: "20. desember 2015"
+date: "20. December 2015"
 output: html_document
 ---
+## Background
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+Using devices such as *Jawbone Up*, *Nike FuelBand*, and *Fitbit* it is now possible to collect a large amount of data about personal activity relatively inexpensively. These type of devices are part of the quantified self movement - a group of enthusiasts who take measurements about themselves regularly to improve their health, to find patterns in their behavior, or because they are tech geeks. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. The goal of this project is to use data from accelerometers on the belt, forearm, arm, and dumbell of 6 participants to identify when they perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website [here](http://groupware.les.inf.puc-rio.br/har) (see the section on the Weight Lifting Exercise Dataset). 
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+## Data Description and Processing
 
-```{r}
-summary(cars)
+```{r data import}
+# Read data
+library(ggplot2)
+library(caret)
+library(RRF)
+
+rm(list=ls())
+setwd("~/R/DSS-PML/")
+
+training <- read.csv("./input/pml-training.csv", stringsAsFactors = F, na.strings = c("NA", "", " "))
+testing <- read.csv("./input/pml-testing.csv", stringsAsFactors = F, na.strings = c("NA", "", " "))
 ```
 
-You can also embed plots, for example: embedded plot
+The dataset consists of 19622 observations in 160 variables. From these, 7 variables contain record identification information (user, time measurements are taken, etc.) and 100 variables contain various statistical summaries with a lot of missing values. All of these 107 variables will be, therefore, dropped. Label variable `classe` consists of 5 levels:
 
-```{r, echo=FALSE}
-plot(cars)
+- A: activity correctly performed
+- B: throwing the elbows to the front
+- C: lifting the dumbbell only halfway
+- D: lowering the dumbbell only halfway
+- E: throwing the hips to the front
+
+```{r cleaning, message=FALSE}
+col2rem <- sapply(testing, function(x) {sum(is.na(x)) > 0})
+col2rem[1:7] <- TRUE # removing "X", user_name", "raw_timestamp_part_1", "raw_timestamp_part_2", "cvtd_timestamp", "new_window", "num_window"
+training <- training[, !col2rem]
+testing <- testing[, !col2rem]
+
+training$classe <- as.factor(training$classe)
+
+lab <- ncol(training)
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+As expected, measurements taken from the same device are correlated, as well as similar measurements taken by different devices are sometimes correlated.
+
+```{r correlations, message=FALSE}
+#install.packages("corrplot")
+library(corrplot)
+tcor <- cor(training[,-lab])
+corrplot(tcor, type="lower", order="hclust", tl.col="black",tl.srt=45,  tl.cex = 0.7)#
+```
+
+Some of the variables exibit high degree of correlation, therefore it might be useful to consider dropping some of them and therefore reduce the dimensionality of the model. First we want to split the training set into two parts to perform model validation.
+
+## Feature selection
+
+```{r data partitioning}
+set.seed(777)
+inTrain <- createDataPartition(training$classe, p = 0.75, list = FALSE)
+train <- training[inTrain, ]
+valid <- training[-inTrain, ]
+cat("Training:" , dim(train), "Validation:", dim(valid), "\n") 
+```
+
+Feature selection is performed using Regularized Random Forest. Model tuning is performed to find optimal *mtry* parameter (number of variables considered for splits).
+
+```{r feature selection, message=FALSE}
+set.seed(777)
+flagReg <- 1
+tunerrf <- tuneRRF(train[, -lab], train[, lab], stepFactor=1.4, ntreeTry=250, improve=0.01,
+                   trace=T, plot=F, doBest=F, flagReg=flagReg)
+tmtry = tunerrf[which.min(tunerrf[,2]),1]
+```
+
+Seems like around 7 splits is a good number. Keep in mind that the search is performed on already regularized model, so the optimal number of splits is quite low.
+
+```{r mtry plot}
+qplot(mtry, OOBError, data=as.data.frame(tunerrf), geom = c("point", "path"))+ theme_grey(base_size = 14) 
+```
+
+Lets assess performance of regularized model and calculate variable importance
+
+```{r RRF model}
+rrfmod1 <- RRF(train[, -lab], train[, lab], ntree=500, mtry = tmtry, 
+               importance = T, localImp=F, flagReg=flagReg, coefReg = 0.8)
+predrrf1 <- predict(rrfmod1, valid[,-lab], type="class")
+aa1 <- confusionMatrix(predrrf1, valid[, lab])$overall['Accuracy']
+cat("Model accuracy", aa1) #, mean(aa1, aa2))
+```
+
+The following chart illustrates suggested variables and their importance
+
+```{r Variable importance plot}
+RRF::varImpPlot(rrfmod1, main = "Variable importance")
+```
+
+These 31 variables will be used in further analysis, the rest of the independent variables will be dropped.
+
+```{r dropping regularized variables, message=FALSE}
+impRF1 <- rrfmod1$importance
+vars1 <- rownames(impRF1)
+vimp1 <- data.frame(vars1, impRF1, row.names = NULL)
+MDG1<- as.character(vimp1[vimp1$MeanDecreaseGini>0 & order(vimp1$MeanDecreaseGini, decreasing = T), "vars1"])
+#cat("Selected variables:", paste(MDG1, collapse = ", "))
+training <- training[, c(MDG1, "classe")]
+testing <- testing[, c(MDG1, "problem_id")]
+lab <- ncol(training)
+```
+
+## Model training using parallelized 5-fold cross-validation
+
+In order to develop the cross-validated model the generic function was developed, which allows adding various ML models at will. Cross-validation was performed using the following models:
+- Random Forest (using `randomForest` package)
+- RBF support vector machine (using `e1071` package)
+- C5.0 mixed model (using `C50` package)
+- Multi-class gbm model (using `gbm` package)
+- Regularized Random Forest, which will attempt further reduction in the dimensionality (using `RRF` package)
+- k-Nearest Neighbors (kNN) model (using `class` package)
+- Bagging Classification Tree model (using `ipred` package)
+
+```{r fitMod function, message=FALSE}
+fitMod <- function(xtrain, ytrain, xtest, ytest, method){
+  #returns prediction vector
+  if (method=="rf"){
+    require(randomForest, quietly=T)
+    fit <- randomForest(x=xtrain, y=ytrain, mtry=tmtry)
+    pred  <- predict(fit, newdata=xtest)
+    
+  }else if(method=="svm"){
+    require(e1071, quietly=T)
+    fit <- svm(x=xtrain, y=ytrain, probability = FALSE)
+    pred <- predict(fit, xtest)
+    
+  }else if(method=="earth"){
+    require(earth, quietly=T)
+    fit <- earth(x=xtrain, y=ytrain) # build model
+    pred <- as.numeric(predict(fit, newdata = xtest, type = "class"))
+    
+  }else if(method=="C50"){
+    require(C50, quietly=T)
+    fit <- C5.0(x=xtrain, y=ytrain) # build model
+    pred <- predict(fit, newdata = xtest, type = "class")
+
+  }else if(method=="RRF"){
+    require(RRF, quietly=T)
+    fit <- RRF(x=xtrain, y=ytrain, mtry=tmtry, flagReg=flagReg, coefReg = 0.8)
+    pred  <- predict(fit, newdata=xtest, type = "class")
+    
+  }else if(method=="gbm"){
+    require(gbm, quietly=T)
+    fit <- gbm.fit(x=xtrain, y=ytrain, distribution ="multinomial", interaction.depth=6, shrinkage=0.1, n.trees=40, verbose = FALSE)
+    p <- predict(fit, newdata=xtest, n.trees=40, type="response")
+    pred <- factor(apply(p, 1, which.max), levels=c(1:5), labels = c("A", "B", "C", "D", "E"))
+    
+  }else if(method=="knn"){
+    require(class, quietly=T)
+    pred <- knn(train =xtrain, test = xtest, cl= ytrain) # build model
+    
+  }else if(method=="ipred"){
+    require(ipred, quietly=T)
+    train <- cbind(xtrain, classe=ytrain)
+    fit <- bagging(classe~., data=train) # build model
+    pred <- predict(fit, newdata = xtest, type="class")      
+    
+  }else{
+    cat("Unknown method! Aborting")
+    pred <- NA
+  }
+  
+  names(pred) <- method
+  #  cat("Accuracy of ", method, " for this fold is:", confusionMatrix(as.numeric(pred), as.numeric(ytest))$overall['Accuracy'], "\n")
+  return(pred)
+}
+```
+
+Cross-validation was done using parallelized procedure (utilizing `foreach` and `doParallel` packages) on a cluster with 8 cores. There is also a need to re-assemble the training set to match the order of the cv folds.
+
+```{r Parallelized cross-validation, message=FALSE}
+k <-5
+set.seed(777)
+folds <- createFolds(training[, lab], k = k, list = FALSE)
+pred.df <- NULL
+models <- c("rf", "svm", "C50", "gbm", "RRF", "knn", "ipred")
+library(foreach)
+library(doParallel)
+cl <- makeCluster(8)
+registerDoParallel(cl)
+pred.df <- foreach(i = 1:k, .packages=c("caret"), .combine = rbind) %dopar% {
+           sapply(models, function(x){
+                       cat("Fitting ", x, " model \n")
+                       fitMod(xtrain=training[folds!=i,-lab], ytrain=training[folds!=i,lab], 
+                              xtest=training[folds==i,-lab],  ytest= training[folds==i,lab], method = x)})
+       } # end of foreach
+pred.df <- as.data.frame(pred.df)
+
+train.cv <- NULL
+for (n in 1:k){
+  train.cv <- rbind(train.cv, training[folds==n,])
+}
+rownames(train.cv) <- NULL
+rownames(pred.df) <- NULL
+```
+
+## Ensembling
+
+Predictions are blended using the simple majority voting, and assessed for individual (and joint) accuracy. Simple blending helps the accuracy.
+
+```{r Blending of cv results}
+
+pred.df$blended <- factor(apply(data.frame(lapply(pred.df, as.numeric), stringsAsFactors=FALSE), 1, function(idx) which.max(tabulate(idx))), 
+                          levels=c(1:5), labels=c("A", "B", "C", "D", "E"))
+err <- NULL
+for (i in 1:(ncol(pred.df))){
+  e <- data.frame(model=names(pred.df)[i], value= confusionMatrix(pred.df[,i], train.cv$classe)$overall['Accuracy'], stringsAsFactors = FALSE)
+  err <- rbind(err, e)
+  cat("CV accuracy of", e$model, "is", as.character(e$value), "\n")
+}
+
+```
+
+As one can see, performance of blended model is not better than the best performing algorithm (Random Forest). The true power of ensembling is unlocked through stacking. We will now perform model stacking using the 5-fold cross-validated `gbm` model (reusing the same folds we created in the previous step). 
+
+```{r Stacked CV generalization}
+
+# making the CV stacking model
+straining <- data.frame(pred.df,train.cv)
+slab <- ncol(straining)
+set.seed(777)
+k=5
+
+spred.v <- NULL
+ytest <- NULL
+for (i in 1:k){
+stackedpred <- fitMod(xtrain=straining[folds!=i,-slab], ytrain=straining[folds!=i,slab], xtest=straining[folds==i,-slab],  ytest= straining[folds==i,slab], method = "gbm")
+spred.v <- c(spred.v, stackedpred)
+ytest <-c(ytest, straining[folds==i,slab])
+}
+
+spred.v <- factor(spred.v, levels=c(1:5), labels=c("A", "B", "C", "D", "E"))
+ytest <- factor(ytest, levels=c(1:5), labels=c("A", "B", "C", "D", "E"))
+
+#stacked prediction accuracy
+cat("CV accuracy of stacked model\n") 
+confusionMatrix(spred.v, ytest)
+
+```
+
+The stacked model has an accuracy of 99.6% with a 95% confidence interval of (99.5%, 99.68%) on the validation set. Sensitivity of Class A and specificity of Class E are best.
+
+Out-of-sample performance of the stacked model on the 5-fold CV is inidicative of performance of the same model on the testing set (to be done in the next step). Stacking allows to sqeeze additional accuracy decimals from already well-performing bag of models.
+
+```{r Stacked CV accuracy}
+
+e <- data.frame(model="stacked", value= confusionMatrix(spred.v, ytest)$overall['Accuracy'], stringsAsFactors = FALSE)
+err <- rbind(err, e)
+ggplot(data=err, aes(x=model, y=value, group=1)) + theme_grey(base_size = 14) +
+    geom_line() +
+    geom_point() +
+    xlab("Model") + ylab("Out-of-sample accuracy") +
+    ggtitle("Performance of CV models")
+#stacked model is what we go for!
+
+```
+
+## Final predictions on the testing set
+
+Now we are ready to perform prediction on the test set. The whole training set will be used for training the same models. The results will be again, blended and stacked.
+
+```{r Predicting the testing}
+# making prediction on test set
+test.df <- sapply(models, function(x){
+  cat("Fitting ", x, " model \n")
+  fitMod(xtrain=training[,-lab], ytrain=training[,lab], xtest=testing[,-lab],  ytest= NULL, method = x)})
+
+rownames(test.df) <- NULL
+
+test.df <- as.data.frame(test.df)
+test.df$blended <- factor(apply(data.frame(lapply(test.df, as.numeric), stringsAsFactors=FALSE), 1, function(idx) which.max(tabulate(idx))), 
+                          levels=c(1:5), labels=c("A", "B", "C", "D", "E"))
+stesting <- data.frame(test.df,testing)
+tlab <- ncol(stesting)
+```
+
+Fitting the final stacked model and preparing the submission files.
+
+```{r Making final stacked prediction}
+set.seed(777)
+#making prediction on the stacked model
+finalpred <- fitMod(xtrain=straining[ ,-slab], ytrain=straining[,slab], xtest=stesting[,-tlab],  ytest= NULL, method = "gbm")
+
+answers <- as.character(finalpred)
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+pml_write_files(answers)
+
+
+```
+
+Finally, the stacked cross-validated model was applied to the testing set that consists of 20 observations that were not used during the training neither validation. Results are submitted for grading.
+
+```{r stopping the cluster, echo=FALSE}
+registerDoSEQ() -> unregister
+stopCluster(cl)
+```
+
